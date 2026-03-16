@@ -5,10 +5,13 @@ from pathlib import Path
 from PySide6.QtCore import QSignalBlocker, Qt
 from PySide6.QtGui import QAction, QActionGroup, QPixmap
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QDoubleSpinBox,
+    QDockWidget,
     QFormLayout,
     QFileDialog,
     QGroupBox,
+    QHeaderView,
     QLabel,
     QMainWindow,
     QMessageBox,
@@ -16,6 +19,8 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QSplitter,
     QToolBar,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -25,6 +30,7 @@ from pixel_track.controller import ProjectController, ToolMode
 from pixel_track.frame_sequence import collect_frame_paths, supported_image_suffixes
 from pixel_track.model import MeasurementStep
 from pixel_track.ui.image_view import ImageView
+from pixel_track.ui.speed_plot import SpeedPlotWidget
 
 
 class MainWindow(QMainWindow):
@@ -57,6 +63,8 @@ class MainWindow(QMainWindow):
             "Use Current mode to set the starting position of the object."
         )
         self.measurement_status_label.setWordWrap(True)
+        self._history_metrics: list[SegmentMetrics] = []
+        self._suppress_history_navigation = False
         self._last_open_directory = Path.cwd()
         self._pending_calibration_start: tuple[float, float] | None = None
 
@@ -64,11 +72,12 @@ class MainWindow(QMainWindow):
         self._build_menu()
         self._build_toolbar()
         self._build_layout()
+        self._build_analysis_dock()
         self._connect_signals()
         self._refresh_labels()
 
         self.statusBar().showMessage(
-            "Sprint 3: calibrate a frame, then mark previous/current positions to measure speed."
+            "Sprint 4: measure movement and inspect the speed history below."
         )
 
     def _configure_inputs(self) -> None:
@@ -158,6 +167,32 @@ class MainWindow(QMainWindow):
         splitter.setSizes([1100, 340])
         self.setCentralWidget(splitter)
 
+    def _build_analysis_dock(self) -> None:
+        dock = QDockWidget("Analysis", self)
+        dock.setObjectName("analysisDock")
+        dock.setAllowedAreas(Qt.BottomDockWidgetArea)
+
+        self.speed_plot = SpeedPlotWidget(dock)
+        self.history_table = QTableWidget(0, 6, dock)
+        self.history_table.setHorizontalHeaderLabels(
+            ["From", "To", "t_end (s)", "dt (s)", "Distance (m)", "Speed (m/s)"]
+        )
+        self.history_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.history_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.history_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.history_table.setAlternatingRowColors(True)
+        self.history_table.verticalHeader().setVisible(False)
+        self.history_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+
+        dock_content = QWidget(dock)
+        dock_layout = QVBoxLayout(dock_content)
+        dock_layout.setContentsMargins(8, 8, 8, 8)
+        dock_layout.addWidget(self.speed_plot)
+        dock_layout.addWidget(self.history_table)
+        dock.setWidget(dock_content)
+
+        self.addDockWidget(Qt.BottomDockWidgetArea, dock)
+
     def _build_sidebar(self) -> QWidget:
         container = QWidget(self)
         layout = QVBoxLayout(container)
@@ -219,17 +254,20 @@ class MainWindow(QMainWindow):
         self.controller.calibration_changed.connect(self._on_calibration_changed)
         self.controller.measurement_changed.connect(self._on_measurement_changed)
         self.controller.metrics_changed.connect(self._on_metrics_changed)
+        self.controller.history_changed.connect(self._on_history_changed)
         self.frame_spinbox.valueChanged.connect(self._on_frame_spinbox_changed)
         self.fps_spinbox.valueChanged.connect(self.controller.set_fps)
         self.calibration_length_spinbox.valueChanged.connect(self._on_calibration_length_changed)
         self.image_view.zoom_changed.connect(self._on_zoom_changed)
         self.image_view.scene_clicked.connect(self._on_scene_clicked)
         self.image_view.scene_hovered.connect(self._on_scene_hovered)
+        self.history_table.cellDoubleClicked.connect(self._on_history_row_activated)
 
     def _on_frame_changed(self, _: int) -> None:
         self._cancel_pending_calibration()
         self._load_current_frame()
         self._refresh_labels()
+        self._sync_history_selection()
 
     def _on_project_changed(self, _: object) -> None:
         self._cancel_pending_calibration()
@@ -280,6 +318,10 @@ class MainWindow(QMainWindow):
 
     def _on_metrics_changed(self, metrics: object) -> None:
         self._refresh_measurement_panel(metrics)
+
+    def _on_history_changed(self, metrics: object) -> None:
+        self._history_metrics = list(metrics)
+        self._refresh_history_views()
 
     def _on_calibration_length_changed(self, value: float) -> None:
         if self.controller.current_calibration() is None:
@@ -349,6 +391,12 @@ class MainWindow(QMainWindow):
         if self._pending_calibration_start is None:
             return
         self.image_view.set_calibration_preview(self._pending_calibration_start, (x, y))
+
+    def _on_history_row_activated(self, row: int, _column: int) -> None:
+        if row < 0 or row >= len(self._history_metrics):
+            return
+        metric = self._history_metrics[row]
+        self.controller.set_frame(metric.to_frame)
 
     def _refresh_labels(self) -> None:
         frame_count = self.controller.project.frame_count
@@ -467,6 +515,52 @@ class MainWindow(QMainWindow):
             self.speed_label.setText(f"{metrics.speed_mps:.3f} m/s")
 
         self._refresh_measurement_mode_status(measurement, metrics)
+
+    def _refresh_history_views(self) -> None:
+        self.speed_plot.set_metrics(self._history_metrics, self.controller.current_frame_index)
+
+        self._suppress_history_navigation = True
+        try:
+            self.history_table.setRowCount(len(self._history_metrics))
+            for row, metric in enumerate(self._history_metrics):
+                values = [
+                    str(metric.from_frame + 1),
+                    str(metric.to_frame + 1),
+                    f"{metric.t_end_s:.3f}",
+                    f"{metric.dt_s:.3f}",
+                    f"{metric.distance_m:.3f}",
+                    f"{metric.speed_mps:.3f}",
+                ]
+                for column, value in enumerate(values):
+                    item = QTableWidgetItem(value)
+                    item.setData(Qt.UserRole, metric.to_frame)
+                    self.history_table.setItem(row, column, item)
+        finally:
+            self._suppress_history_navigation = False
+
+        self._sync_history_selection()
+
+    def _sync_history_selection(self) -> None:
+        if self._suppress_history_navigation:
+            return
+
+        self.speed_plot.set_metrics(self._history_metrics, self.controller.current_frame_index)
+        target_row = next(
+            (row for row, metric in enumerate(self._history_metrics) if metric.to_frame == self.controller.current_frame_index),
+            -1,
+        )
+
+        self._suppress_history_navigation = True
+        try:
+            self.history_table.clearSelection()
+            if target_row >= 0:
+                self.history_table.selectRow(target_row)
+                self.history_table.scrollToItem(
+                    self.history_table.item(target_row, 0),
+                    QAbstractItemView.PositionAtCenter,
+                )
+        finally:
+            self._suppress_history_navigation = False
 
     def _refresh_measurement_mode_status(
         self,

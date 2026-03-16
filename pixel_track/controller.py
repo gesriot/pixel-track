@@ -5,7 +5,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal
 
-from pixel_track.analysis import SegmentMetrics, segment_metrics_for_frame
+from pixel_track.analysis import SegmentMetrics, build_segment_metrics, segment_metrics_for_frame
 from pixel_track.model import Calibration, MeasurementStep, Point, Project
 
 
@@ -25,6 +25,7 @@ class ProjectController(QObject):
     calibration_changed = Signal(object)
     measurement_changed = Signal(object)
     metrics_changed = Signal(object)
+    history_changed = Signal(object)
 
     def __init__(self, project: Project, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -52,6 +53,9 @@ class ProjectController(QObject):
 
     def current_segment_metrics(self) -> SegmentMetrics | None:
         return segment_metrics_for_frame(self._project, self._current_frame_index)
+
+    def segment_metrics_history(self) -> list[SegmentMetrics]:
+        return build_segment_metrics(self._project)
 
     def previous_measured_frame_index(self, frame_index: int | None = None) -> int | None:
         current_index = self._current_frame_index if frame_index is None else frame_index
@@ -94,6 +98,7 @@ class ProjectController(QObject):
         self.calibration_changed.emit(self.current_calibration())
         self.measurement_changed.emit(self.current_measurement())
         self.metrics_changed.emit(self.current_segment_metrics())
+        self.history_changed.emit(self.segment_metrics_history())
 
     def set_frame(self, index: int) -> None:
         if self._project.frame_count == 0:
@@ -134,6 +139,7 @@ class ProjectController(QObject):
         self._project.fps = fps
         self.fps_changed.emit(fps)
         self.metrics_changed.emit(self.current_segment_metrics())
+        self.history_changed.emit(self.segment_metrics_history())
 
     def set_current_calibration(self, p1: Point, p2: Point, length_m: float) -> Calibration | None:
         calibration = self._build_calibration(p1, p2, length_m)
@@ -144,6 +150,7 @@ class ProjectController(QObject):
         override.calibration = calibration
         self.calibration_changed.emit(self.current_calibration())
         self.metrics_changed.emit(self.current_segment_metrics())
+        self.history_changed.emit(self.segment_metrics_history())
         return calibration
 
     def set_current_calibration_length(self, length_m: float) -> Calibration | None:
@@ -159,6 +166,7 @@ class ProjectController(QObject):
         override.calibration = calibration
         self.calibration_changed.emit(self.current_calibration())
         self.metrics_changed.emit(self.current_segment_metrics())
+        self.history_changed.emit(self.segment_metrics_history())
         return calibration
 
     def clear_current_frame_calibration(self) -> None:
@@ -166,6 +174,7 @@ class ProjectController(QObject):
             return
         self.calibration_changed.emit(self.current_calibration())
         self.metrics_changed.emit(self.current_segment_metrics())
+        self.history_changed.emit(self.segment_metrics_history())
 
     def set_previous_point(self, pos: Point) -> MeasurementStep:
         step = self._project.measurements.get(self._current_frame_index)
@@ -177,6 +186,7 @@ class ProjectController(QObject):
         self._project.measurements[self._current_frame_index] = step
         self.measurement_changed.emit(step)
         self.metrics_changed.emit(self.current_segment_metrics())
+        self.history_changed.emit(self.segment_metrics_history())
         return step
 
     def set_current_point(self, pos: Point) -> MeasurementStep:
@@ -188,6 +198,7 @@ class ProjectController(QObject):
         self._project.measurements[self._current_frame_index] = step
         self.measurement_changed.emit(step)
         self.metrics_changed.emit(self.current_segment_metrics())
+        self.history_changed.emit(self.segment_metrics_history())
         return step
 
     def clear_current_measurement(self) -> None:
@@ -195,6 +206,7 @@ class ProjectController(QObject):
             return
         self.measurement_changed.emit(self.current_measurement())
         self.metrics_changed.emit(self.current_segment_metrics())
+        self.history_changed.emit(self.segment_metrics_history())
 
     def _build_calibration(self, p1: Point, p2: Point, length_m: float) -> Calibration | None:
         if length_m <= 0:

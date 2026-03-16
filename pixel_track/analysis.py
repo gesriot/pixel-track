@@ -27,7 +27,7 @@ def build_segment_metrics(project: Project) -> list[SegmentMetrics]:
         if step.current_point_px is not None
     )
 
-    for previous_frame, current_frame in zip(frame_indices, frame_indices[1:]):
+    for current_frame in frame_indices[1:]:
         current_metrics = segment_metrics_for_frame(project, current_frame)
         if current_metrics is not None:
             metrics.append(current_metrics)
@@ -72,3 +72,7 @@ def segment_metrics_for_frame(project: Project, frame_index: int) -> SegmentMetr
         speed_mps=speed_mps,
         t_end_s=frame_index / project.fps,
     )
+
+
+def speed_series(metrics: list[SegmentMetrics]) -> tuple[list[float], list[float]]:
+    return [metric.t_end_s for metric in metrics], [metric.speed_mps for metric in metrics]
