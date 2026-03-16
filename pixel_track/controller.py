@@ -123,6 +123,17 @@ class ProjectController(QObject):
     def previous_frame(self) -> None:
         self.set_frame(self._current_frame_index - 1)
 
+    def jump_frames(self, offset: int) -> None:
+        self.set_frame(self._current_frame_index + offset)
+
+    def first_frame(self) -> None:
+        self.set_frame(0)
+
+    def last_frame(self) -> None:
+        if self._project.frame_count == 0:
+            return
+        self.set_frame(self._project.frame_count - 1)
+
     def set_tool_mode(self, mode: ToolMode) -> None:
         if mode == self._tool_mode:
             return
@@ -162,6 +173,32 @@ class ProjectController(QObject):
             return None
 
         calibration = Calibration(current.p1, current.p2, length_m)
+        override = self._project.get_or_create_override(self._current_frame_index)
+        override.calibration = calibration
+        self.calibration_changed.emit(self.current_calibration())
+        self.metrics_changed.emit(self.current_segment_metrics())
+        self.history_changed.emit(self.segment_metrics_history())
+        return calibration
+
+    def set_current_calibration_endpoint(
+        self,
+        endpoint: str,
+        pos: Point,
+    ) -> Calibration | None:
+        current = self.current_calibration()
+        if current is None:
+            return None
+
+        if endpoint == "p1":
+            calibration = Calibration(pos, current.p2, current.length_m)
+        elif endpoint == "p2":
+            calibration = Calibration(current.p1, pos, current.length_m)
+        else:
+            raise ValueError(f"Unsupported calibration endpoint: {endpoint}")
+
+        if calibration.pixel_length == 0:
+            return None
+
         override = self._project.get_or_create_override(self._current_frame_index)
         override.calibration = calibration
         self.calibration_changed.emit(self.current_calibration())

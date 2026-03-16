@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from pathlib import Path
 
 from PySide6.QtCore import QSignalBlocker, Qt
-from PySide6.QtGui import QAction, QActionGroup, QPixmap
+from PySide6.QtGui import QAction, QActionGroup, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QDoubleSpinBox,
@@ -69,8 +70,11 @@ class MainWindow(QMainWindow):
         self._last_open_directory = Path.cwd()
         self._pending_calibration_start: tuple[float, float] | None = None
         self._project_file_path: Path | None = None
+        self._pixmap_cache: OrderedDict[Path, QPixmap] = OrderedDict()
+        self._pixmap_cache_capacity = 12
 
         self._configure_inputs()
+        self._create_actions()
         self._build_menu()
         self._build_toolbar()
         self._build_layout()
@@ -80,7 +84,7 @@ class MainWindow(QMainWindow):
         self._refresh_window_title()
 
         self.statusBar().showMessage(
-            "Sprint 5: save projects, reload sessions, and export measurements to CSV."
+            "Sprint 6: use hotkeys, drag handles directly on the image, and work faster on long sequences."
         )
 
     def _configure_inputs(self) -> None:
@@ -98,45 +102,92 @@ class MainWindow(QMainWindow):
         self.calibration_length_spinbox.setSuffix(" m")
         self.calibration_length_spinbox.setValue(10.0)
 
+    def _create_actions(self) -> None:
+        self._open_frames_action = QAction("Open Frames Folder...", self)
+        self._open_frames_action.setShortcut(QKeySequence("Ctrl+Shift+O"))
+        self._open_frames_action.triggered.connect(self._open_frames_folder)
+
+        self._open_project_action = QAction("Open Project...", self)
+        self._open_project_action.setShortcut(QKeySequence("Ctrl+O"))
+        self._open_project_action.triggered.connect(self._open_project)
+
+        self._save_project_action = QAction("Save Project", self)
+        self._save_project_action.setShortcut(QKeySequence("Ctrl+S"))
+        self._save_project_action.triggered.connect(self._save_project)
+
+        self._save_project_as_action = QAction("Save Project As...", self)
+        self._save_project_as_action.setShortcut(QKeySequence("Ctrl+Shift+S"))
+        self._save_project_as_action.triggered.connect(self._save_project_as)
+
+        self._export_csv_action = QAction("Export Measurements CSV...", self)
+        self._export_csv_action.setShortcut(QKeySequence("Ctrl+E"))
+        self._export_csv_action.triggered.connect(self._export_measurements_csv)
+
+        self._prev_frame_action = QAction("Prev", self)
+        self._prev_frame_action.setShortcut(QKeySequence(Qt.Key_Left))
+        self._prev_frame_action.triggered.connect(self.controller.previous_frame)
+
+        self._next_frame_action = QAction("Next", self)
+        self._next_frame_action.setShortcut(QKeySequence(Qt.Key_Right))
+        self._next_frame_action.triggered.connect(self.controller.next_frame)
+
+        self._jump_back_action = QAction("Back 10", self)
+        self._jump_back_action.setShortcut(QKeySequence(Qt.Key_PageUp))
+        self._jump_back_action.triggered.connect(lambda: self.controller.jump_frames(-10))
+
+        self._jump_forward_action = QAction("Forward 10", self)
+        self._jump_forward_action.setShortcut(QKeySequence(Qt.Key_PageDown))
+        self._jump_forward_action.triggered.connect(lambda: self.controller.jump_frames(10))
+
+        self._first_frame_action = QAction("First Frame", self)
+        self._first_frame_action.setShortcut(QKeySequence(Qt.Key_Home))
+        self._first_frame_action.triggered.connect(self.controller.first_frame)
+
+        self._last_frame_action = QAction("Last Frame", self)
+        self._last_frame_action.setShortcut(QKeySequence(Qt.Key_End))
+        self._last_frame_action.triggered.connect(self.controller.last_frame)
+
+        self._zoom_in_action = QAction("Zoom In", self)
+        self._zoom_in_action.setShortcuts(
+            [QKeySequence("Ctrl+="), QKeySequence("Ctrl++")]
+        )
+        self._zoom_in_action.triggered.connect(self.image_view.zoom_in)
+
+        self._zoom_out_action = QAction("Zoom Out", self)
+        self._zoom_out_action.setShortcuts([QKeySequence("Ctrl+-")])
+        self._zoom_out_action.triggered.connect(self.image_view.zoom_out)
+
+        self._fit_view_action = QAction("Fit to Frame", self)
+        self._fit_view_action.setShortcut(QKeySequence("Ctrl+0"))
+        self._fit_view_action.triggered.connect(self.image_view.reset_view_state)
+
+        for action in (
+            self._jump_back_action,
+            self._jump_forward_action,
+            self._first_frame_action,
+            self._last_frame_action,
+            self._zoom_in_action,
+            self._zoom_out_action,
+            self._fit_view_action,
+        ):
+            self.addAction(action)
+
     def _build_menu(self) -> None:
         file_menu = self.menuBar().addMenu("File")
-
-        open_action = QAction("Open Frames Folder...", self)
-        open_action.triggered.connect(self._open_frames_folder)
-        file_menu.addAction(open_action)
-
-        open_project_action = QAction("Open Project...", self)
-        open_project_action.triggered.connect(self._open_project)
-        file_menu.addAction(open_project_action)
+        file_menu.addAction(self._open_frames_action)
+        file_menu.addAction(self._open_project_action)
 
         file_menu.addSeparator()
-
-        save_project_action = QAction("Save Project", self)
-        save_project_action.triggered.connect(self._save_project)
-        file_menu.addAction(save_project_action)
-
-        save_project_as_action = QAction("Save Project As...", self)
-        save_project_as_action.triggered.connect(self._save_project_as)
-        file_menu.addAction(save_project_as_action)
+        file_menu.addAction(self._save_project_action)
+        file_menu.addAction(self._save_project_as_action)
 
         file_menu.addSeparator()
-
-        export_csv_action = QAction("Export Measurements CSV...", self)
-        export_csv_action.triggered.connect(self._export_measurements_csv)
-        file_menu.addAction(export_csv_action)
+        file_menu.addAction(self._export_csv_action)
 
     def _build_toolbar(self) -> None:
         toolbar = QToolBar("Navigation", self)
         toolbar.setMovable(False)
         self.addToolBar(toolbar)
-
-        open_button = QPushButton("Open Folder")
-        self._prev_button = QPushButton("Prev")
-        self._next_button = QPushButton("Next")
-
-        open_button.clicked.connect(self._open_frames_folder)
-        self._prev_button.clicked.connect(self.controller.previous_frame)
-        self._next_button.clicked.connect(self.controller.next_frame)
 
         self._mode_action_group = QActionGroup(self)
         self._mode_action_group.setExclusive(True)
@@ -166,20 +217,40 @@ class MainWindow(QMainWindow):
             lambda checked: checked and self.controller.set_tool_mode(ToolMode.MARK_CURRENT)
         )
 
+        self._edit_handles_action = QAction("Edit Handles", self)
+        self._edit_handles_action.setCheckable(True)
+        self._edit_handles_action.triggered.connect(
+            lambda checked: checked and self.controller.set_tool_mode(ToolMode.EDIT_HANDLES)
+        )
+
+        self._navigate_action.setShortcut(QKeySequence("N"))
+        self._calibrate_action.setShortcut(QKeySequence("C"))
+        self._mark_previous_action.setShortcut(QKeySequence("P"))
+        self._mark_current_action.setShortcut(QKeySequence("M"))
+        self._edit_handles_action.setShortcut(QKeySequence("E"))
+
         self._mode_action_group.addAction(self._navigate_action)
         self._mode_action_group.addAction(self._calibrate_action)
         self._mode_action_group.addAction(self._mark_previous_action)
         self._mode_action_group.addAction(self._mark_current_action)
+        self._mode_action_group.addAction(self._edit_handles_action)
 
-        toolbar.addWidget(open_button)
+        toolbar.addAction(self._open_frames_action)
         toolbar.addSeparator()
-        toolbar.addWidget(self._prev_button)
-        toolbar.addWidget(self._next_button)
+        toolbar.addAction(self._prev_frame_action)
+        toolbar.addAction(self._next_frame_action)
+        toolbar.addAction(self._jump_back_action)
+        toolbar.addAction(self._jump_forward_action)
         toolbar.addSeparator()
         toolbar.addAction(self._navigate_action)
         toolbar.addAction(self._calibrate_action)
         toolbar.addAction(self._mark_previous_action)
         toolbar.addAction(self._mark_current_action)
+        toolbar.addAction(self._edit_handles_action)
+        toolbar.addSeparator()
+        toolbar.addAction(self._zoom_in_action)
+        toolbar.addAction(self._zoom_out_action)
+        toolbar.addAction(self._fit_view_action)
 
     def _build_layout(self) -> None:
         splitter = QSplitter(Qt.Horizontal, self)
@@ -256,8 +327,9 @@ class MainWindow(QMainWindow):
         notes_box = QGroupBox("Status", container)
         notes_layout = QVBoxLayout(notes_box)
         notes = QLabel(
-            "Use Calibrate to set scale, then Current to mark the start point. On later frames "
-            "mark Previous and Current to compute distance and speed."
+            "Shortcuts: Left/Right for frames, PageUp/PageDown for +/-10, Home/End for first/last, "
+            "N/C/P/M/E for modes, Ctrl+Plus/Ctrl+Minus/Ctrl+0 for zoom. In Edit Handles mode, drag "
+            "the visible points directly on the image."
         )
         notes.setWordWrap(True)
         notes_layout.addWidget(notes)
@@ -284,6 +356,7 @@ class MainWindow(QMainWindow):
         self.image_view.zoom_changed.connect(self._on_zoom_changed)
         self.image_view.scene_clicked.connect(self._on_scene_clicked)
         self.image_view.scene_hovered.connect(self._on_scene_hovered)
+        self.image_view.overlay_handle_released.connect(self._on_overlay_handle_released)
         self.history_table.cellDoubleClicked.connect(self._on_history_row_activated)
 
     def _on_frame_changed(self, _: int) -> None:
@@ -294,12 +367,14 @@ class MainWindow(QMainWindow):
 
     def _on_project_changed(self, _: object) -> None:
         self._cancel_pending_calibration()
+        self._pixmap_cache.clear()
         self.image_view.reset_view_state()
         self._refresh_labels()
         self._refresh_window_title()
 
     def _on_mode_changed(self, mode: str) -> None:
         self.mode_label.setText(mode)
+        self.image_view.set_edit_handles_enabled(mode == ToolMode.EDIT_HANDLES.value)
         with QSignalBlocker(self._navigate_action):
             self._navigate_action.setChecked(mode == ToolMode.NAVIGATE.value)
         with QSignalBlocker(self._calibrate_action):
@@ -308,11 +383,17 @@ class MainWindow(QMainWindow):
             self._mark_previous_action.setChecked(mode == ToolMode.MARK_PREVIOUS.value)
         with QSignalBlocker(self._mark_current_action):
             self._mark_current_action.setChecked(mode == ToolMode.MARK_CURRENT.value)
+        with QSignalBlocker(self._edit_handles_action):
+            self._edit_handles_action.setChecked(mode == ToolMode.EDIT_HANDLES.value)
 
         if mode != ToolMode.CALIBRATE.value:
             self._cancel_pending_calibration()
             if mode == ToolMode.NAVIGATE.value:
                 self.calibration_status_label.setText("Navigate mode is active.")
+            elif mode == ToolMode.EDIT_HANDLES.value:
+                self.calibration_status_label.setText(
+                    "Drag visible handles on the image to refine calibration or measurement points."
+                )
         elif self.controller.project.frame_count == 0:
             self.calibration_status_label.setText("Load frames before calibrating.")
         else:
@@ -416,6 +497,30 @@ class MainWindow(QMainWindow):
             return
         self.image_view.set_calibration_preview(self._pending_calibration_start, (x, y))
 
+    def _on_overlay_handle_released(self, role: str, x: float, y: float) -> None:
+        point = (x, y)
+        if role == "calibration_p1":
+            calibration = self.controller.set_current_calibration_endpoint("p1", point)
+            if calibration is not None:
+                self.statusBar().showMessage("Calibration start updated.")
+            return
+
+        if role == "calibration_p2":
+            calibration = self.controller.set_current_calibration_endpoint("p2", point)
+            if calibration is not None:
+                self.statusBar().showMessage("Calibration end updated.")
+            return
+
+        if role == "measurement_previous":
+            self.controller.set_previous_point(point)
+            self.statusBar().showMessage("Previous measurement point updated.")
+            return
+
+        if role == "measurement_current":
+            self.controller.set_current_point(point)
+            self.statusBar().showMessage("Current measurement point updated.")
+            return
+
     def _on_history_row_activated(self, row: int, _column: int) -> None:
         if row < 0 or row >= len(self._history_metrics):
             return
@@ -426,8 +531,16 @@ class MainWindow(QMainWindow):
         frame_count = self.controller.project.frame_count
         directory = self.controller.project.source_directory
         self.folder_label.setText(str(directory) if directory else "No folder selected")
-        self._prev_button.setEnabled(frame_count > 0 and self.controller.current_frame_index > 0)
-        self._next_button.setEnabled(
+        self._prev_frame_action.setEnabled(frame_count > 0 and self.controller.current_frame_index > 0)
+        self._next_frame_action.setEnabled(
+            frame_count > 0 and self.controller.current_frame_index < frame_count - 1
+        )
+        self._jump_back_action.setEnabled(frame_count > 0 and self.controller.current_frame_index > 0)
+        self._jump_forward_action.setEnabled(
+            frame_count > 0 and self.controller.current_frame_index < frame_count - 1
+        )
+        self._first_frame_action.setEnabled(frame_count > 0 and self.controller.current_frame_index > 0)
+        self._last_frame_action.setEnabled(
             frame_count > 0 and self.controller.current_frame_index < frame_count - 1
         )
 
@@ -594,7 +707,7 @@ class MainWindow(QMainWindow):
         if frame_path is None:
             return
 
-        pixmap = QPixmap(str(frame_path))
+        pixmap = self._load_pixmap(frame_path)
         if pixmap.isNull():
             self.image_view.show_placeholder(
                 f"Could not load image:\n{frame_path.name}\n\nTry another file or folder."
@@ -603,6 +716,7 @@ class MainWindow(QMainWindow):
             return
 
         self.image_view.set_pixmap(pixmap)
+        self._preload_adjacent_pixmaps()
         self.statusBar().showMessage(f"Viewing frame {self.controller.current_frame_index + 1}")
 
     def _refresh_calibration_panel(self) -> None:
@@ -733,6 +847,17 @@ class MainWindow(QMainWindow):
                 )
             return
 
+        if self.controller.tool_mode is ToolMode.EDIT_HANDLES:
+            if measurement is None and self.controller.current_calibration() is None:
+                self.measurement_status_label.setText(
+                    "Nothing to edit on this frame yet. Create a calibration or measurement first."
+                )
+            else:
+                self.measurement_status_label.setText(
+                    "Edit mode is active. Drag the visible handles directly on the image."
+                )
+            return
+
         if measurement is None:
             self.measurement_status_label.setText(
                 "Use Current mode to set the starting position of the object."
@@ -782,3 +907,33 @@ class MainWindow(QMainWindow):
             else "Unsaved Session"
         )
         self.setWindowTitle(f"Pixel Track - {project_name}")
+
+    def _load_pixmap(self, frame_path: Path) -> QPixmap:
+        cached_pixmap = self._pixmap_cache.pop(frame_path, None)
+        if cached_pixmap is not None:
+            self._pixmap_cache[frame_path] = cached_pixmap
+            return cached_pixmap
+
+        pixmap = QPixmap(str(frame_path))
+        if not pixmap.isNull():
+            self._pixmap_cache[frame_path] = pixmap
+            while len(self._pixmap_cache) > self._pixmap_cache_capacity:
+                self._pixmap_cache.popitem(last=False)
+        return pixmap
+
+    def _preload_adjacent_pixmaps(self) -> None:
+        if self.controller.project.frame_count == 0:
+            return
+
+        current = self.controller.current_frame_index
+        preload_indices = (
+            current - 2,
+            current - 1,
+            current + 1,
+            current + 2,
+        )
+        for index in preload_indices:
+            if 0 <= index < self.controller.project.frame_count:
+                frame_path = self.controller.project.get_frame_path(index)
+                if frame_path not in self._pixmap_cache:
+                    self._load_pixmap(frame_path)

@@ -3,9 +3,9 @@ from __future__ import annotations
 from PySide6.QtCore import QPoint, QPointF, QRectF, QTimer, Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QPainter, QPen, QPixmap, QWheelEvent
 from PySide6.QtWidgets import (
-    QGraphicsEllipseItem,
     QGraphicsItem,
     QGraphicsLineItem,
+    QGraphicsObject,
     QGraphicsPixmapItem,
     QGraphicsScene,
     QGraphicsSimpleTextItem,
@@ -15,10 +15,67 @@ from PySide6.QtWidgets import (
 from pixel_track.model import Calibration, MeasurementStep, Point
 
 
+class _OverlayHandleItem(QGraphicsObject):
+    handle_moved = Signal(str, float, float)
+    handle_released = Signal(str, float, float)
+
+    def __init__(
+        self,
+        role: str,
+        stroke_color: str,
+        fill_color: str,
+        radius: float = 6.0,
+        parent: QGraphicsItem | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._role = role
+        self._radius = radius
+        self._pen = QPen(QColor(stroke_color), 1.5)
+        self._pen.setCosmetic(True)
+        self._brush = QBrush(QColor(fill_color))
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
+        self.setZValue(10.0)
+        self.set_interactive(False)
+
+    def boundingRect(self) -> QRectF:
+        diameter = self._radius * 2
+        return QRectF(-self._radius, -self._radius, diameter, diameter)
+
+    def paint(self, painter: QPainter, _option, _widget=None) -> None:
+        painter.setPen(self._pen)
+        painter.setBrush(self._brush)
+        painter.drawEllipse(self.boundingRect())
+
+    def set_interactive(self, enabled: bool) -> None:
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, enabled)
+        self.setAcceptedMouseButtons(Qt.LeftButton if enabled else Qt.NoButton)
+        self.setCursor(Qt.OpenHandCursor if enabled else Qt.ArrowCursor)
+
+    def itemChange(self, change, value):
+        if change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
+            next_pos = self.pos() if not isinstance(value, QPointF) else value
+            self.handle_moved.emit(self._role, next_pos.x(), next_pos.y())
+        return super().itemChange(change, value)
+
+    def mousePressEvent(self, event) -> None:
+        if self.flags() & QGraphicsItem.GraphicsItemFlag.ItemIsMovable:
+            self.setCursor(Qt.ClosedHandCursor)
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        super().mouseReleaseEvent(event)
+        if self.flags() & QGraphicsItem.GraphicsItemFlag.ItemIsMovable:
+            self.setCursor(Qt.OpenHandCursor)
+            current_pos = self.pos()
+            self.handle_released.emit(self._role, current_pos.x(), current_pos.y())
+
+
 class ImageView(QGraphicsView):
     zoom_changed = Signal(float)
     scene_clicked = Signal(float, float)
     scene_hovered = Signal(float, float)
+    overlay_handle_released = Signal(str, float, float)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -28,12 +85,12 @@ class ImageView(QGraphicsView):
         self._calibration: Calibration | None = None
         self._calibration_line_item: QGraphicsLineItem | None = None
         self._preview_line_item: QGraphicsLineItem | None = None
-        self._endpoint_items: list[QGraphicsEllipseItem] = []
+        self._endpoint_items: dict[str, _OverlayHandleItem] = {}
         self._calibration_label_item: QGraphicsSimpleTextItem | None = None
         self._measurement: MeasurementStep | None = None
         self._measurement_line_item: QGraphicsLineItem | None = None
-        self._measurement_endpoint_items: list[QGraphicsEllipseItem] = []
-        self._measurement_label_items: list[QGraphicsSimpleTextItem] = []
+        self._measurement_endpoint_items: dict[str, _OverlayHandleItem] = {}
+        self._measurement_label_items: dict[str, QGraphicsSimpleTextItem] = {}
         self._user_zoom_factor = 1.0
         self._center_norm = (0.5, 0.5)
         self._center_scene_pos: QPointF | None = None
@@ -42,6 +99,8 @@ class ImageView(QGraphicsView):
         self._preview_end: Point | None = None
         self._zoom_correction_generation = 0
         self._suspend_center_capture = False
+        self._edit_handles_enabled = False
+        self._updating_handle_geometry = False
 
         self.setScene(self._scene)
         self.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
@@ -50,7 +109,7 @@ class ImageView(QGraphicsView):
         self.setResizeAnchor(QGraphicsView.AnchorViewCenter)
         self.setBackgroundBrush(Qt.darkGray)
         self.show_placeholder(
-            "Sprint 3\n\nOpen frames, calibrate, then mark previous/current positions to measure motion."
+            "Sprint 6\n\nOpen frames, calibrate, then mark or drag points to measure motion."
         )
 
     @property
@@ -114,12 +173,33 @@ class ImageView(QGraphicsView):
             self._capture_center_norm()
 
     def set_calibration(self, calibration: Calibration | None) -> None:
-        self._calibration = calibration
+        if calibration is None:
+            self._calibration = None
+        else:
+            self._calibration = Calibration(calibration.p1, calibration.p2, calibration.length_m)
         self._redraw_overlay()
 
     def set_measurement(self, measurement: MeasurementStep | None) -> None:
-        self._measurement = measurement
+        if measurement is None:
+            self._measurement = None
+        else:
+            self._measurement = MeasurementStep(
+                frame_index=measurement.frame_index,
+                current_point_px=measurement.current_point_px,
+                previous_point_on_this_frame_px=measurement.previous_point_on_this_frame_px,
+                previous_point_is_auto=measurement.previous_point_is_auto,
+            )
         self._redraw_overlay()
+
+    def set_edit_handles_enabled(self, enabled: bool) -> None:
+        self._edit_handles_enabled = enabled
+        self._update_handle_interactivity()
+
+    def zoom_in(self) -> None:
+        self._zoom_relative(1.15)
+
+    def zoom_out(self) -> None:
+        self._zoom_relative(1 / 1.15)
 
     def set_calibration_preview(self, start: Point | None, end: Point | None = None) -> None:
         self._preview_start = start
@@ -242,11 +322,11 @@ class ImageView(QGraphicsView):
     def _reset_scene_item_refs(self) -> None:
         self._calibration_line_item = None
         self._preview_line_item = None
-        self._endpoint_items = []
+        self._endpoint_items = {}
         self._calibration_label_item = None
         self._measurement_line_item = None
-        self._measurement_endpoint_items = []
-        self._measurement_label_items = []
+        self._measurement_endpoint_items = {}
+        self._measurement_label_items = {}
 
     def _redraw_overlay(self) -> None:
         self._remove_calibration_items()
@@ -265,21 +345,18 @@ class ImageView(QGraphicsView):
                 self._calibration.p2[1],
                 line_pen,
             )
-
-            endpoint_pen = QPen(QColor("#0b7285"), 1.5)
-            endpoint_pen.setCosmetic(True)
-            for point in (self._calibration.p1, self._calibration.p2):
-                item = self._scene.addEllipse(
-                    -5,
-                    -5,
-                    10,
-                    10,
-                    endpoint_pen,
-                    QBrush(QColor("#99e9f2")),
-                )
-                item.setPos(point[0], point[1])
-                item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations)
-                self._endpoint_items.append(item)
+            self._endpoint_items["calibration_p1"] = self._create_handle_item(
+                "calibration_p1",
+                self._calibration.p1,
+                "#0b7285",
+                "#99e9f2",
+            )
+            self._endpoint_items["calibration_p2"] = self._create_handle_item(
+                "calibration_p2",
+                self._calibration.p2,
+                "#0b7285",
+                "#99e9f2",
+            )
 
             midpoint_x = (self._calibration.p1[0] + self._calibration.p2[0]) / 2
             midpoint_y = (self._calibration.p1[1] + self._calibration.p2[1]) / 2
@@ -294,6 +371,7 @@ class ImageView(QGraphicsView):
 
         self._redraw_measurement_items()
         self._redraw_preview_line()
+        self._update_handle_interactivity()
 
     def _redraw_preview_line(self) -> None:
         self._remove_preview_item()
@@ -311,10 +389,10 @@ class ImageView(QGraphicsView):
         )
 
     def _remove_calibration_items(self) -> None:
-        for item in self._endpoint_items:
+        for item in self._endpoint_items.values():
             if item.scene() is self._scene:
                 self._scene.removeItem(item)
-        self._endpoint_items = []
+        self._endpoint_items = {}
 
         if self._calibration_line_item is not None:
             if self._calibration_line_item.scene() is self._scene:
@@ -351,30 +429,39 @@ class ImageView(QGraphicsView):
             )
 
         if previous_point is not None:
-            self._add_measurement_marker(previous_point, "#e8590c", "#ffd8a8", "P")
+            self._add_measurement_marker(
+                "measurement_previous",
+                previous_point,
+                "#e8590c",
+                "#ffd8a8",
+                "P",
+            )
 
         if current_point is not None:
-            self._add_measurement_marker(current_point, "#2b8a3e", "#b2f2bb", "C")
+            self._add_measurement_marker(
+                "measurement_current",
+                current_point,
+                "#2b8a3e",
+                "#b2f2bb",
+                "C",
+            )
 
     def _add_measurement_marker(
         self,
+        role: str,
         point: Point,
         stroke_color: str,
         fill_color: str,
         label: str,
     ) -> None:
-        pen = QPen(QColor(stroke_color), 1.5)
-        pen.setCosmetic(True)
-        marker = self._scene.addEllipse(-6, -6, 12, 12, pen, QBrush(QColor(fill_color)))
-        marker.setPos(point[0], point[1])
-        marker.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations)
-        self._measurement_endpoint_items.append(marker)
+        marker = self._create_handle_item(role, point, stroke_color, fill_color)
+        self._measurement_endpoint_items[role] = marker
 
         text = self._scene.addSimpleText(label)
         text.setBrush(QColor("white"))
         text.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations)
         text.setPos(point[0] + 10, point[1] - 10)
-        self._measurement_label_items.append(text)
+        self._measurement_label_items[role] = text
 
     def _remove_measurement_items(self) -> None:
         if self._measurement_line_item is not None:
@@ -382,15 +469,15 @@ class ImageView(QGraphicsView):
                 self._scene.removeItem(self._measurement_line_item)
             self._measurement_line_item = None
 
-        for item in self._measurement_endpoint_items:
+        for item in self._measurement_endpoint_items.values():
             if item.scene() is self._scene:
                 self._scene.removeItem(item)
-        self._measurement_endpoint_items = []
+        self._measurement_endpoint_items = {}
 
-        for item in self._measurement_label_items:
+        for item in self._measurement_label_items.values():
             if item.scene() is self._scene:
                 self._scene.removeItem(item)
-        self._measurement_label_items = []
+        self._measurement_label_items = {}
 
     def _apply_zoom_at_viewport_pos(self, viewport_pos: QPointF, next_zoom: float) -> None:
         if self._pixmap_item is None:
@@ -438,3 +525,133 @@ class ImageView(QGraphicsView):
 
     def _invalidate_pending_zoom_corrections(self) -> None:
         self._zoom_correction_generation += 1
+
+    def _zoom_relative(self, factor: float) -> None:
+        if self._pixmap_item is None:
+            return
+        viewport_center = QPointF(self.viewport().rect().center())
+        next_zoom = min(25.0, max(0.2, self._user_zoom_factor * factor))
+        self._apply_zoom_at_viewport_pos(viewport_center, next_zoom)
+
+    def _create_handle_item(
+        self,
+        role: str,
+        point: Point,
+        stroke_color: str,
+        fill_color: str,
+    ) -> _OverlayHandleItem:
+        item = _OverlayHandleItem(role, stroke_color, fill_color)
+        item.setPos(point[0], point[1])
+        item.set_interactive(self._edit_handles_enabled)
+        item.handle_moved.connect(self._on_overlay_handle_dragged)
+        item.handle_released.connect(self._on_overlay_handle_released)
+        self._scene.addItem(item)
+        return item
+
+    def _update_handle_interactivity(self) -> None:
+        for item in list(self._endpoint_items.values()) + list(self._measurement_endpoint_items.values()):
+            item.set_interactive(self._edit_handles_enabled)
+
+    def _on_overlay_handle_dragged(self, role: str, x: float, y: float) -> None:
+        if self._updating_handle_geometry:
+            return
+
+        point = (x, y)
+        if role == "calibration_p1" and self._calibration is not None:
+            self._calibration = Calibration(point, self._calibration.p2, self._calibration.length_m)
+            self._refresh_calibration_geometry()
+            return
+
+        if role == "calibration_p2" and self._calibration is not None:
+            self._calibration = Calibration(self._calibration.p1, point, self._calibration.length_m)
+            self._refresh_calibration_geometry()
+            return
+
+        if self._measurement is None:
+            return
+
+        if role == "measurement_previous":
+            self._measurement.previous_point_on_this_frame_px = point
+            self._measurement.previous_point_is_auto = False
+            self._refresh_measurement_geometry()
+        elif role == "measurement_current":
+            self._measurement.current_point_px = point
+            self._refresh_measurement_geometry()
+
+    def _on_overlay_handle_released(self, role: str, x: float, y: float) -> None:
+        self.overlay_handle_released.emit(role, x, y)
+
+    def _refresh_calibration_geometry(self) -> None:
+        if self._calibration is None:
+            return
+        self._updating_handle_geometry = True
+        try:
+            if self._calibration_line_item is not None:
+                self._calibration_line_item.setLine(
+                    self._calibration.p1[0],
+                    self._calibration.p1[1],
+                    self._calibration.p2[0],
+                    self._calibration.p2[1],
+                )
+
+            handle = self._endpoint_items.get("calibration_p1")
+            if handle is not None:
+                handle.setPos(self._calibration.p1[0], self._calibration.p1[1])
+            handle = self._endpoint_items.get("calibration_p2")
+            if handle is not None:
+                handle.setPos(self._calibration.p2[0], self._calibration.p2[1])
+
+            if self._calibration_label_item is not None:
+                midpoint_x = (self._calibration.p1[0] + self._calibration.p2[0]) / 2
+                midpoint_y = (self._calibration.p1[1] + self._calibration.p2[1]) / 2
+                self._calibration_label_item.setText(f"{self._calibration.length_m:.3f} m")
+                self._calibration_label_item.setPos(midpoint_x + 8, midpoint_y + 8)
+        finally:
+            self._updating_handle_geometry = False
+
+    def _refresh_measurement_geometry(self) -> None:
+        if self._measurement is None:
+            return
+
+        previous_point = self._measurement.previous_point_on_this_frame_px
+        current_point = self._measurement.current_point_px
+        self._updating_handle_geometry = True
+        try:
+            if previous_point is not None and current_point is not None:
+                if self._measurement_line_item is None:
+                    line_pen = QPen(QColor("#ffd43b"), 2.0)
+                    line_pen.setCosmetic(True)
+                    self._measurement_line_item = self._scene.addLine(
+                        previous_point[0],
+                        previous_point[1],
+                        current_point[0],
+                        current_point[1],
+                        line_pen,
+                    )
+                else:
+                    self._measurement_line_item.setLine(
+                        previous_point[0],
+                        previous_point[1],
+                        current_point[0],
+                        current_point[1],
+                    )
+            elif self._measurement_line_item is not None:
+                if self._measurement_line_item.scene() is self._scene:
+                    self._scene.removeItem(self._measurement_line_item)
+                self._measurement_line_item = None
+
+            previous_handle = self._measurement_endpoint_items.get("measurement_previous")
+            if previous_point is not None and previous_handle is not None:
+                previous_handle.setPos(previous_point[0], previous_point[1])
+            previous_label = self._measurement_label_items.get("measurement_previous")
+            if previous_point is not None and previous_label is not None:
+                previous_label.setPos(previous_point[0] + 10, previous_point[1] - 10)
+
+            current_handle = self._measurement_endpoint_items.get("measurement_current")
+            if current_point is not None and current_handle is not None:
+                current_handle.setPos(current_point[0], current_point[1])
+            current_label = self._measurement_label_items.get("measurement_current")
+            if current_point is not None and current_label is not None:
+                current_label.setPos(current_point[0] + 10, current_point[1] - 10)
+        finally:
+            self._updating_handle_geometry = False
