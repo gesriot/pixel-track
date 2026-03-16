@@ -5,7 +5,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal
 
-from pixel_track.model import Project
+from pixel_track.model import Calibration, Point, Project
 
 
 class ToolMode(str, Enum):
@@ -21,6 +21,7 @@ class ProjectController(QObject):
     project_changed = Signal(object)
     mode_changed = Signal(str)
     fps_changed = Signal(float)
+    calibration_changed = Signal(object)
 
     def __init__(self, project: Project, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -39,6 +40,16 @@ class ProjectController(QObject):
     @property
     def tool_mode(self) -> ToolMode:
         return self._tool_mode
+
+    def current_calibration(self) -> Calibration | None:
+        return self._project.effective_calibration(self._current_frame_index)
+
+    def current_calibration_source_index(self) -> int | None:
+        for current in range(self._current_frame_index, -1, -1):
+            override = self._project.frame_overrides.get(current)
+            if override and override.calibration is not None:
+                return current
+        return None
 
     def current_frame_path(self) -> Path | None:
         if self._project.frame_count == 0:
@@ -59,6 +70,7 @@ class ProjectController(QObject):
         self.project_changed.emit(project)
         self.frame_changed.emit(self._current_frame_index)
         self.fps_changed.emit(project.fps)
+        self.calibration_changed.emit(self.current_calibration())
 
     def set_frame(self, index: int) -> None:
         if self._project.frame_count == 0:
@@ -72,6 +84,7 @@ class ProjectController(QObject):
 
         self._current_frame_index = bounded_index
         self.frame_changed.emit(self._current_frame_index)
+        self.calibration_changed.emit(self.current_calibration())
 
     def next_frame(self) -> None:
         self.set_frame(self._current_frame_index + 1)
@@ -94,3 +107,41 @@ class ProjectController(QObject):
 
         self._project.fps = fps
         self.fps_changed.emit(fps)
+
+    def set_current_calibration(self, p1: Point, p2: Point, length_m: float) -> Calibration | None:
+        calibration = self._build_calibration(p1, p2, length_m)
+        if calibration is None:
+            return None
+
+        override = self._project.get_or_create_override(self._current_frame_index)
+        override.calibration = calibration
+        self.calibration_changed.emit(self.current_calibration())
+        return calibration
+
+    def set_current_calibration_length(self, length_m: float) -> Calibration | None:
+        if length_m <= 0:
+            return None
+
+        current = self.current_calibration()
+        if current is None:
+            return None
+
+        calibration = Calibration(current.p1, current.p2, length_m)
+        override = self._project.get_or_create_override(self._current_frame_index)
+        override.calibration = calibration
+        self.calibration_changed.emit(self.current_calibration())
+        return calibration
+
+    def clear_current_frame_calibration(self) -> None:
+        if self._project.frame_overrides.pop(self._current_frame_index, None) is None:
+            return
+        self.calibration_changed.emit(self.current_calibration())
+
+    def _build_calibration(self, p1: Point, p2: Point, length_m: float) -> Calibration | None:
+        if length_m <= 0:
+            return None
+
+        calibration = Calibration(p1, p2, length_m)
+        if calibration.pixel_length == 0:
+            return None
+        return calibration

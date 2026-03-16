@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import QSignalBlocker, Qt
-from PySide6.QtGui import QAction, QPixmap
+from PySide6.QtGui import QAction, QActionGroup, QPixmap
 from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFormLayout,
@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from pixel_track.controller import ProjectController
+from pixel_track.controller import ProjectController, ToolMode
 from pixel_track.frame_sequence import collect_frame_paths, supported_image_suffixes
 from pixel_track.ui.image_view import ImageView
 
@@ -38,12 +38,20 @@ class MainWindow(QMainWindow):
         self.folder_label = QLabel("No folder selected")
         self.folder_label.setWordWrap(True)
         self.mode_label = QLabel(controller.tool_mode.value)
-        self.distance_label = QLabel("0.00 m")
-        self.speed_label = QLabel("0.00 m/s")
+        self.distance_label = QLabel("—")
+        self.speed_label = QLabel("—")
         self.zoom_label = QLabel("100%")
         self.fps_spinbox = QDoubleSpinBox(self)
         self.frame_spinbox = QSpinBox(self)
+        self.calibration_length_spinbox = QDoubleSpinBox(self)
+        self.calibration_pixel_label = QLabel("—")
+        self.calibration_distance_label = QLabel("—")
+        self.calibration_scale_label = QLabel("—")
+        self.calibration_source_label = QLabel("Not set")
+        self.calibration_status_label = QLabel("Select a frame and enter calibration mode.")
+        self.calibration_status_label.setWordWrap(True)
         self._last_open_directory = Path.cwd()
+        self._pending_calibration_start: tuple[float, float] | None = None
 
         self._configure_inputs()
         self._build_menu()
@@ -52,7 +60,7 @@ class MainWindow(QMainWindow):
         self._connect_signals()
         self._refresh_labels()
 
-        self.statusBar().showMessage("Sprint 1: open a frames folder to begin.")
+        self.statusBar().showMessage("Sprint 2: open a frames folder and use Calibrate mode.")
 
     def _configure_inputs(self) -> None:
         self.fps_spinbox.setRange(0.001, 10_000.0)
@@ -62,6 +70,12 @@ class MainWindow(QMainWindow):
 
         self.frame_spinbox.setRange(1, 1)
         self.frame_spinbox.setEnabled(False)
+
+        self.calibration_length_spinbox.setRange(0.001, 1_000_000.0)
+        self.calibration_length_spinbox.setDecimals(3)
+        self.calibration_length_spinbox.setSingleStep(1.0)
+        self.calibration_length_spinbox.setSuffix(" m")
+        self.calibration_length_spinbox.setValue(10.0)
 
     def _build_menu(self) -> None:
         file_menu = self.menuBar().addMenu("File")
@@ -83,10 +97,32 @@ class MainWindow(QMainWindow):
         self._prev_button.clicked.connect(self.controller.previous_frame)
         self._next_button.clicked.connect(self.controller.next_frame)
 
+        self._mode_action_group = QActionGroup(self)
+        self._mode_action_group.setExclusive(True)
+
+        self._navigate_action = QAction("Navigate", self)
+        self._navigate_action.setCheckable(True)
+        self._navigate_action.setChecked(True)
+        self._navigate_action.triggered.connect(
+            lambda checked: checked and self.controller.set_tool_mode(ToolMode.NAVIGATE)
+        )
+
+        self._calibrate_action = QAction("Calibrate", self)
+        self._calibrate_action.setCheckable(True)
+        self._calibrate_action.triggered.connect(
+            lambda checked: checked and self.controller.set_tool_mode(ToolMode.CALIBRATE)
+        )
+
+        self._mode_action_group.addAction(self._navigate_action)
+        self._mode_action_group.addAction(self._calibrate_action)
+
         toolbar.addWidget(open_button)
         toolbar.addSeparator()
         toolbar.addWidget(self._prev_button)
         toolbar.addWidget(self._next_button)
+        toolbar.addSeparator()
+        toolbar.addAction(self._navigate_action)
+        toolbar.addAction(self._calibrate_action)
 
     def _build_layout(self) -> None:
         splitter = QSplitter(Qt.Horizontal, self)
@@ -110,6 +146,19 @@ class MainWindow(QMainWindow):
         project_form.addRow("FPS", self.fps_spinbox)
         project_form.addRow("Zoom", self.zoom_label)
 
+        calibration_box = QGroupBox("Calibration", container)
+        calibration_form = QFormLayout(calibration_box)
+        calibration_form.addRow("Length", self.calibration_length_spinbox)
+        calibration_form.addRow("Pixel length", self.calibration_pixel_label)
+        calibration_form.addRow("Distance", self.calibration_distance_label)
+        calibration_form.addRow("Scale", self.calibration_scale_label)
+        calibration_form.addRow("Source", self.calibration_source_label)
+        calibration_form.addRow("Status", self.calibration_status_label)
+
+        clear_button = QPushButton("Clear Current Frame")
+        clear_button.clicked.connect(self._clear_current_frame_calibration)
+        calibration_form.addRow("", clear_button)
+
         measurement_box = QGroupBox("Measurement", container)
         measurement_form = QFormLayout(measurement_box)
         measurement_form.addRow("Distance", self.distance_label)
@@ -118,13 +167,14 @@ class MainWindow(QMainWindow):
         notes_box = QGroupBox("Status", container)
         notes_layout = QVBoxLayout(notes_box)
         notes = QLabel(
-            "This sprint loads frame folders, preserves zoom while moving between frames, "
-            "and lets you set FPS from the sidebar."
+            "Calibration mode lets you click two points on the current frame to set a known "
+            "real-world distance in meters."
         )
         notes.setWordWrap(True)
         notes_layout.addWidget(notes)
 
         layout.addWidget(project_box)
+        layout.addWidget(calibration_box)
         layout.addWidget(measurement_box)
         layout.addWidget(notes_box)
         layout.addStretch(1)
@@ -135,20 +185,38 @@ class MainWindow(QMainWindow):
         self.controller.project_changed.connect(self._on_project_changed)
         self.controller.mode_changed.connect(self._on_mode_changed)
         self.controller.fps_changed.connect(self._on_fps_changed)
+        self.controller.calibration_changed.connect(self._on_calibration_changed)
         self.frame_spinbox.valueChanged.connect(self._on_frame_spinbox_changed)
         self.fps_spinbox.valueChanged.connect(self.controller.set_fps)
+        self.calibration_length_spinbox.valueChanged.connect(self._on_calibration_length_changed)
         self.image_view.zoom_changed.connect(self._on_zoom_changed)
+        self.image_view.scene_clicked.connect(self._on_scene_clicked)
+        self.image_view.scene_hovered.connect(self._on_scene_hovered)
 
     def _on_frame_changed(self, _: int) -> None:
+        self._cancel_pending_calibration()
         self._load_current_frame()
         self._refresh_labels()
 
     def _on_project_changed(self, _: object) -> None:
+        self._cancel_pending_calibration()
         self.image_view.reset_view_state()
         self._refresh_labels()
 
     def _on_mode_changed(self, mode: str) -> None:
         self.mode_label.setText(mode)
+        with QSignalBlocker(self._navigate_action):
+            self._navigate_action.setChecked(mode == ToolMode.NAVIGATE.value)
+        with QSignalBlocker(self._calibrate_action):
+            self._calibrate_action.setChecked(mode == ToolMode.CALIBRATE.value)
+
+        if mode != ToolMode.CALIBRATE.value:
+            self._cancel_pending_calibration()
+            self.calibration_status_label.setText("Navigate mode is active.")
+        elif self.controller.project.frame_count == 0:
+            self.calibration_status_label.setText("Load frames before calibrating.")
+        else:
+            self.calibration_status_label.setText("Click the first point of the calibration segment.")
 
     def _on_fps_changed(self, fps: float) -> None:
         with QSignalBlocker(self.fps_spinbox):
@@ -161,6 +229,51 @@ class MainWindow(QMainWindow):
 
     def _on_zoom_changed(self, zoom_factor: float) -> None:
         self.zoom_label.setText(f"{zoom_factor * 100:.0f}%")
+
+    def _on_calibration_changed(self, calibration: object) -> None:
+        self.image_view.set_calibration(calibration)
+        self._refresh_calibration_panel()
+
+    def _on_calibration_length_changed(self, value: float) -> None:
+        if self.controller.current_calibration() is None:
+            return
+        self.controller.set_current_calibration_length(value)
+
+    def _on_scene_clicked(self, x: float, y: float) -> None:
+        if self.controller.tool_mode is not ToolMode.CALIBRATE:
+            return
+        if self.controller.project.frame_count == 0:
+            return
+
+        point = (x, y)
+        if self._pending_calibration_start is None:
+            self._pending_calibration_start = point
+            self.image_view.set_calibration_preview(point, point)
+            self.calibration_status_label.setText("Click the second point of the calibration segment.")
+            self.statusBar().showMessage("Calibration: first point selected.")
+            return
+
+        calibration = self.controller.set_current_calibration(
+            self._pending_calibration_start,
+            point,
+            self.calibration_length_spinbox.value(),
+        )
+        self._cancel_pending_calibration()
+
+        if calibration is None:
+            self.calibration_status_label.setText(
+                "Calibration failed. Use a positive length and two different points."
+            )
+            self.statusBar().showMessage("Calibration failed.")
+            return
+
+        self.calibration_status_label.setText("Calibration saved for the current frame.")
+        self.statusBar().showMessage("Calibration updated.")
+
+    def _on_scene_hovered(self, x: float, y: float) -> None:
+        if self._pending_calibration_start is None:
+            return
+        self.image_view.set_calibration_preview(self._pending_calibration_start, (x, y))
 
     def _refresh_labels(self) -> None:
         frame_count = self.controller.project.frame_count
@@ -180,6 +293,7 @@ class MainWindow(QMainWindow):
             self.image_view.show_placeholder(
                 "No frames loaded yet.\n\nUse File -> Open Frames Folder... to load an image sequence."
             )
+            self.calibration_status_label.setText("Load frames before calibrating.")
         else:
             current = self.controller.current_frame_index + 1
             self.frame_label.setText(f"{current} / {frame_count}")
@@ -187,6 +301,11 @@ class MainWindow(QMainWindow):
             with QSignalBlocker(self.frame_spinbox):
                 self.frame_spinbox.setRange(1, frame_count)
                 self.frame_spinbox.setValue(current)
+            if self.controller.tool_mode is ToolMode.CALIBRATE and self._pending_calibration_start is None:
+                self.calibration_status_label.setText(
+                    "Click the first point of the calibration segment."
+                )
+        self._refresh_calibration_panel()
 
     def _open_frames_folder(self) -> None:
         directory = QFileDialog.getExistingDirectory(
@@ -229,3 +348,42 @@ class MainWindow(QMainWindow):
 
         self.image_view.set_pixmap(pixmap)
         self.statusBar().showMessage(f"Viewing frame {self.controller.current_frame_index + 1}")
+
+    def _refresh_calibration_panel(self) -> None:
+        calibration = self.controller.current_calibration()
+        if calibration is None:
+            self.calibration_pixel_label.setText("—")
+            self.calibration_distance_label.setText("—")
+            self.calibration_scale_label.setText("—")
+            self.calibration_source_label.setText("Not set")
+            return
+
+        source_index = self.controller.current_calibration_source_index()
+        if source_index is None:
+            source_text = "Not set"
+        elif source_index == self.controller.current_frame_index:
+            source_text = f"Frame {source_index + 1}"
+        else:
+            source_text = f"Inherited from frame {source_index + 1}"
+
+        self.calibration_pixel_label.setText(f"{calibration.pixel_length:.2f} px")
+        self.calibration_distance_label.setText(f"{calibration.length_m:.3f} m")
+        self.calibration_scale_label.setText(f"{calibration.pixels_per_meter:.3f} px/m")
+        self.calibration_source_label.setText(source_text)
+        with QSignalBlocker(self.calibration_length_spinbox):
+            self.calibration_length_spinbox.setValue(calibration.length_m)
+
+    def _cancel_pending_calibration(self) -> None:
+        self._pending_calibration_start = None
+        self.image_view.clear_calibration_preview()
+
+    def _clear_current_frame_calibration(self) -> None:
+        self._cancel_pending_calibration()
+        self.controller.clear_current_frame_calibration()
+        if self.controller.current_calibration() is None:
+            self.calibration_status_label.setText("No calibration is set for this frame yet.")
+            self.statusBar().showMessage("Calibration cleared from current frame.")
+            return
+
+        self.calibration_status_label.setText("Current frame override cleared. Inherited calibration is shown.")
+        self.statusBar().showMessage("Current frame calibration override cleared.")
