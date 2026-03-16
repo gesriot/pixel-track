@@ -21,32 +21,54 @@ def distance_meters(calibration: Calibration, start: tuple[float, float], end: t
 
 def build_segment_metrics(project: Project) -> list[SegmentMetrics]:
     metrics: list[SegmentMetrics] = []
-    frame_indices = sorted(project.measurements)
+    frame_indices = sorted(
+        index
+        for index, step in project.measurements.items()
+        if step.current_point_px is not None
+    )
 
     for previous_frame, current_frame in zip(frame_indices, frame_indices[1:]):
-        step = project.measurements[current_frame]
-        calibration = project.effective_calibration(current_frame)
-
-        if calibration is None or step.previous_point_on_this_frame_px is None:
-            continue
-
-        dt_s = (current_frame - previous_frame) / project.fps
-        distance_m = distance_meters(
-            calibration,
-            step.previous_point_on_this_frame_px,
-            step.current_point_px,
-        )
-        speed_mps = distance_m / dt_s if dt_s > 0 else 0.0
-
-        metrics.append(
-            SegmentMetrics(
-                from_frame=previous_frame,
-                to_frame=current_frame,
-                distance_m=distance_m,
-                dt_s=dt_s,
-                speed_mps=speed_mps,
-                t_end_s=current_frame / project.fps,
-            )
-        )
+        current_metrics = segment_metrics_for_frame(project, current_frame)
+        if current_metrics is not None:
+            metrics.append(current_metrics)
 
     return metrics
+
+
+def segment_metrics_for_frame(project: Project, frame_index: int) -> SegmentMetrics | None:
+    step = project.measurements.get(frame_index)
+    calibration = project.effective_calibration(frame_index)
+
+    if (
+        step is None
+        or calibration is None
+        or step.previous_point_on_this_frame_px is None
+        or step.current_point_px is None
+    ):
+        return None
+
+    previous_frame_indices = [
+        index
+        for index, previous_step in project.measurements.items()
+        if index < frame_index and previous_step.current_point_px is not None
+    ]
+    if not previous_frame_indices:
+        return None
+
+    previous_frame = max(previous_frame_indices)
+    dt_s = (frame_index - previous_frame) / project.fps
+    distance_m = distance_meters(
+        calibration,
+        step.previous_point_on_this_frame_px,
+        step.current_point_px,
+    )
+    speed_mps = distance_m / dt_s if dt_s > 0 else 0.0
+
+    return SegmentMetrics(
+        from_frame=previous_frame,
+        to_frame=frame_index,
+        distance_m=distance_m,
+        dt_s=dt_s,
+        speed_mps=speed_mps,
+        t_end_s=frame_index / project.fps,
+    )

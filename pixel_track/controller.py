@@ -5,7 +5,8 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal
 
-from pixel_track.model import Calibration, Point, Project
+from pixel_track.analysis import SegmentMetrics, segment_metrics_for_frame
+from pixel_track.model import Calibration, MeasurementStep, Point, Project
 
 
 class ToolMode(str, Enum):
@@ -22,6 +23,8 @@ class ProjectController(QObject):
     mode_changed = Signal(str)
     fps_changed = Signal(float)
     calibration_changed = Signal(object)
+    measurement_changed = Signal(object)
+    metrics_changed = Signal(object)
 
     def __init__(self, project: Project, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -43,6 +46,23 @@ class ProjectController(QObject):
 
     def current_calibration(self) -> Calibration | None:
         return self._project.effective_calibration(self._current_frame_index)
+
+    def current_measurement(self) -> MeasurementStep | None:
+        return self._project.measurements.get(self._current_frame_index)
+
+    def current_segment_metrics(self) -> SegmentMetrics | None:
+        return segment_metrics_for_frame(self._project, self._current_frame_index)
+
+    def previous_measured_frame_index(self, frame_index: int | None = None) -> int | None:
+        current_index = self._current_frame_index if frame_index is None else frame_index
+        previous_frame_indices = [
+            index
+            for index, step in self._project.measurements.items()
+            if index < current_index and step.current_point_px is not None
+        ]
+        if not previous_frame_indices:
+            return None
+        return max(previous_frame_indices)
 
     def current_calibration_source_index(self) -> int | None:
         for current in range(self._current_frame_index, -1, -1):
@@ -67,10 +87,13 @@ class ProjectController(QObject):
     def set_project(self, project: Project) -> None:
         self._project = project
         self._current_frame_index = 0
+        self._autofill_previous_point_for_current_frame()
         self.project_changed.emit(project)
         self.frame_changed.emit(self._current_frame_index)
         self.fps_changed.emit(project.fps)
         self.calibration_changed.emit(self.current_calibration())
+        self.measurement_changed.emit(self.current_measurement())
+        self.metrics_changed.emit(self.current_segment_metrics())
 
     def set_frame(self, index: int) -> None:
         if self._project.frame_count == 0:
@@ -83,8 +106,11 @@ class ProjectController(QObject):
             return
 
         self._current_frame_index = bounded_index
+        self._autofill_previous_point_for_current_frame()
         self.frame_changed.emit(self._current_frame_index)
         self.calibration_changed.emit(self.current_calibration())
+        self.measurement_changed.emit(self.current_measurement())
+        self.metrics_changed.emit(self.current_segment_metrics())
 
     def next_frame(self) -> None:
         self.set_frame(self._current_frame_index + 1)
@@ -107,6 +133,7 @@ class ProjectController(QObject):
 
         self._project.fps = fps
         self.fps_changed.emit(fps)
+        self.metrics_changed.emit(self.current_segment_metrics())
 
     def set_current_calibration(self, p1: Point, p2: Point, length_m: float) -> Calibration | None:
         calibration = self._build_calibration(p1, p2, length_m)
@@ -116,6 +143,7 @@ class ProjectController(QObject):
         override = self._project.get_or_create_override(self._current_frame_index)
         override.calibration = calibration
         self.calibration_changed.emit(self.current_calibration())
+        self.metrics_changed.emit(self.current_segment_metrics())
         return calibration
 
     def set_current_calibration_length(self, length_m: float) -> Calibration | None:
@@ -130,12 +158,43 @@ class ProjectController(QObject):
         override = self._project.get_or_create_override(self._current_frame_index)
         override.calibration = calibration
         self.calibration_changed.emit(self.current_calibration())
+        self.metrics_changed.emit(self.current_segment_metrics())
         return calibration
 
     def clear_current_frame_calibration(self) -> None:
         if self._project.frame_overrides.pop(self._current_frame_index, None) is None:
             return
         self.calibration_changed.emit(self.current_calibration())
+        self.metrics_changed.emit(self.current_segment_metrics())
+
+    def set_previous_point(self, pos: Point) -> MeasurementStep:
+        step = self._project.measurements.get(self._current_frame_index)
+        if step is None:
+            step = MeasurementStep(frame_index=self._current_frame_index)
+
+        step.previous_point_on_this_frame_px = pos
+        step.previous_point_is_auto = False
+        self._project.measurements[self._current_frame_index] = step
+        self.measurement_changed.emit(step)
+        self.metrics_changed.emit(self.current_segment_metrics())
+        return step
+
+    def set_current_point(self, pos: Point) -> MeasurementStep:
+        step = self._project.measurements.get(self._current_frame_index)
+        if step is None:
+            step = MeasurementStep(frame_index=self._current_frame_index)
+
+        step.current_point_px = pos
+        self._project.measurements[self._current_frame_index] = step
+        self.measurement_changed.emit(step)
+        self.metrics_changed.emit(self.current_segment_metrics())
+        return step
+
+    def clear_current_measurement(self) -> None:
+        if self._project.measurements.pop(self._current_frame_index, None) is None:
+            return
+        self.measurement_changed.emit(self.current_measurement())
+        self.metrics_changed.emit(self.current_segment_metrics())
 
     def _build_calibration(self, p1: Point, p2: Point, length_m: float) -> Calibration | None:
         if length_m <= 0:
@@ -145,3 +204,25 @@ class ProjectController(QObject):
         if calibration.pixel_length == 0:
             return None
         return calibration
+
+    def _autofill_previous_point_for_current_frame(self) -> None:
+        if self._current_frame_index <= 0:
+            return
+
+        previous_step = self._project.measurements.get(self._current_frame_index - 1)
+        if previous_step is None or previous_step.current_point_px is None:
+            return
+
+        current_step = self._project.measurements.get(self._current_frame_index)
+        if current_step is None:
+            current_step = MeasurementStep(frame_index=self._current_frame_index)
+            self._project.measurements[self._current_frame_index] = current_step
+
+        if (
+            current_step.previous_point_on_this_frame_px is not None
+            and not current_step.previous_point_is_auto
+        ):
+            return
+
+        current_step.previous_point_on_this_frame_px = previous_step.current_point_px
+        current_step.previous_point_is_auto = True

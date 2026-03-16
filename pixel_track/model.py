@@ -38,8 +38,9 @@ class FrameOverride:
 @dataclass(slots=True)
 class MeasurementStep:
     frame_index: int
-    current_point_px: Point
+    current_point_px: Point | None = None
     previous_point_on_this_frame_px: Point | None = None
+    previous_point_is_auto: bool = False
 
 
 @dataclass(slots=True)
