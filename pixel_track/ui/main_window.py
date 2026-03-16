@@ -75,6 +75,7 @@ class MainWindow(QMainWindow):
 
         self._configure_inputs()
         self._create_actions()
+        self._create_undo_actions()
         self._build_menu()
         self._build_toolbar()
         self._build_layout()
@@ -101,6 +102,12 @@ class MainWindow(QMainWindow):
         self.calibration_length_spinbox.setSingleStep(1.0)
         self.calibration_length_spinbox.setSuffix(" m")
         self.calibration_length_spinbox.setValue(10.0)
+
+    def _create_undo_actions(self) -> None:
+        self._undo_action = self.controller.undo_stack.createUndoAction(self, "Undo")
+        self._undo_action.setShortcut(QKeySequence.Undo)
+        self._redo_action = self.controller.undo_stack.createRedoAction(self, "Redo")
+        self._redo_action.setShortcut(QKeySequence.Redo)
 
     def _create_actions(self) -> None:
         self._open_frames_action = QAction("Open Frames Folder...", self)
@@ -173,6 +180,10 @@ class MainWindow(QMainWindow):
             self.addAction(action)
 
     def _build_menu(self) -> None:
+        edit_menu = self.menuBar().addMenu("Edit")
+        edit_menu.addAction(self._undo_action)
+        edit_menu.addAction(self._redo_action)
+
         file_menu = self.menuBar().addMenu("File")
         file_menu.addAction(self._open_frames_action)
         file_menu.addAction(self._open_project_action)
@@ -655,8 +666,8 @@ class MainWindow(QMainWindow):
             return
 
         path = Path(file_path)
-        if path.suffix.lower() != ".json":
-            path = path.with_suffix(".pixeltrack.json")
+        if not path.name.lower().endswith(".json"):
+            path = path.parent / f"{path.stem}.pixeltrack.json"
 
         try:
             save_project(self.controller.project, path)

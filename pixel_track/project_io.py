@@ -144,8 +144,6 @@ def _deserialize_frame_path(
     payload: dict[str, Any],
 ) -> Path:
     stored_path = Path(payload["path"])
-    if payload.get("relative_to_source") and source_directory is not None:
-        return source_directory / stored_path
     relative_to = payload.get("relative_to")
     if relative_to == "source" and source_directory is not None:
         return source_directory / stored_path
