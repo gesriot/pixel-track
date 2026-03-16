@@ -29,6 +29,7 @@ from pixel_track.analysis import SegmentMetrics
 from pixel_track.controller import ProjectController, ToolMode
 from pixel_track.frame_sequence import collect_frame_paths, supported_image_suffixes
 from pixel_track.model import MeasurementStep
+from pixel_track.project_io import export_metrics_csv, load_project, save_project
 from pixel_track.ui.image_view import ImageView
 from pixel_track.ui.speed_plot import SpeedPlotWidget
 
@@ -67,6 +68,7 @@ class MainWindow(QMainWindow):
         self._suppress_history_navigation = False
         self._last_open_directory = Path.cwd()
         self._pending_calibration_start: tuple[float, float] | None = None
+        self._project_file_path: Path | None = None
 
         self._configure_inputs()
         self._build_menu()
@@ -75,9 +77,10 @@ class MainWindow(QMainWindow):
         self._build_analysis_dock()
         self._connect_signals()
         self._refresh_labels()
+        self._refresh_window_title()
 
         self.statusBar().showMessage(
-            "Sprint 4: measure movement and inspect the speed history below."
+            "Sprint 5: save projects, reload sessions, and export measurements to CSV."
         )
 
     def _configure_inputs(self) -> None:
@@ -101,6 +104,26 @@ class MainWindow(QMainWindow):
         open_action = QAction("Open Frames Folder...", self)
         open_action.triggered.connect(self._open_frames_folder)
         file_menu.addAction(open_action)
+
+        open_project_action = QAction("Open Project...", self)
+        open_project_action.triggered.connect(self._open_project)
+        file_menu.addAction(open_project_action)
+
+        file_menu.addSeparator()
+
+        save_project_action = QAction("Save Project", self)
+        save_project_action.triggered.connect(self._save_project)
+        file_menu.addAction(save_project_action)
+
+        save_project_as_action = QAction("Save Project As...", self)
+        save_project_as_action.triggered.connect(self._save_project_as)
+        file_menu.addAction(save_project_as_action)
+
+        file_menu.addSeparator()
+
+        export_csv_action = QAction("Export Measurements CSV...", self)
+        export_csv_action.triggered.connect(self._export_measurements_csv)
+        file_menu.addAction(export_csv_action)
 
     def _build_toolbar(self) -> None:
         toolbar = QToolBar("Navigation", self)
@@ -273,6 +296,7 @@ class MainWindow(QMainWindow):
         self._cancel_pending_calibration()
         self.image_view.reset_view_state()
         self._refresh_labels()
+        self._refresh_window_title()
 
     def _on_mode_changed(self, mode: str) -> None:
         self.mode_label.setText(mode)
@@ -455,7 +479,115 @@ class MainWindow(QMainWindow):
             return
 
         self.controller.load_frames(frame_paths, source_directory=folder)
+        self._project_file_path = None
+        self._refresh_window_title()
         self.statusBar().showMessage(f"Loaded {len(frame_paths)} frame(s) from {folder}.")
+
+    def _open_project(self) -> None:
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open Project",
+            str(self._last_open_directory),
+            "Pixel Track Project (*.pixeltrack.json *.json);;All Files (*)",
+        )
+        if not file_path:
+            return
+
+        path = Path(file_path)
+        try:
+            project = load_project(path)
+        except (OSError, ValueError) as error:
+            QMessageBox.critical(
+                self,
+                "Could Not Open Project",
+                f"Failed to open project:\n{path}\n\n{error}",
+            )
+            self.statusBar().showMessage(f"Failed to open project: {path}")
+            return
+
+        self._project_file_path = path
+        self._last_open_directory = path.parent
+        self.controller.set_project(project)
+        self._refresh_window_title()
+        self.statusBar().showMessage(f"Project loaded from {path}.")
+
+    def _save_project(self) -> None:
+        if self._project_file_path is None:
+            self._save_project_as()
+            return
+
+        try:
+            save_project(self.controller.project, self._project_file_path)
+        except OSError as error:
+            QMessageBox.critical(
+                self,
+                "Could Not Save Project",
+                f"Failed to save project:\n{self._project_file_path}\n\n{error}",
+            )
+            self.statusBar().showMessage(f"Failed to save project: {self._project_file_path}")
+            return
+
+        self._refresh_window_title()
+        self.statusBar().showMessage(f"Project saved to {self._project_file_path}.")
+
+    def _save_project_as(self) -> None:
+        suggested_directory = self._project_file_path.parent if self._project_file_path else self._last_open_directory
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Project As",
+            str(suggested_directory / "project.pixeltrack.json"),
+            "Pixel Track Project (*.pixeltrack.json *.json);;All Files (*)",
+        )
+        if not file_path:
+            return
+
+        path = Path(file_path)
+        if path.suffix.lower() != ".json":
+            path = path.with_suffix(".pixeltrack.json")
+
+        try:
+            save_project(self.controller.project, path)
+        except OSError as error:
+            QMessageBox.critical(
+                self,
+                "Could Not Save Project",
+                f"Failed to save project:\n{path}\n\n{error}",
+            )
+            self.statusBar().showMessage(f"Failed to save project: {path}")
+            return
+
+        self._project_file_path = path
+        self._last_open_directory = path.parent
+        self._refresh_window_title()
+        self.statusBar().showMessage(f"Project saved to {path}.")
+
+    def _export_measurements_csv(self) -> None:
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Measurements CSV",
+            str(self._last_open_directory / "measurements.csv"),
+            "CSV Files (*.csv);;All Files (*)",
+        )
+        if not file_path:
+            return
+
+        path = Path(file_path)
+        if path.suffix.lower() != ".csv":
+            path = path.with_suffix(".csv")
+
+        try:
+            export_metrics_csv(self._history_metrics, path)
+        except OSError as error:
+            QMessageBox.critical(
+                self,
+                "Could Not Export CSV",
+                f"Failed to export CSV:\n{path}\n\n{error}",
+            )
+            self.statusBar().showMessage(f"Failed to export CSV: {path}")
+            return
+
+        self._last_open_directory = path.parent
+        self.statusBar().showMessage(f"Measurements exported to {path}.")
 
     def _load_current_frame(self) -> None:
         frame_path = self.controller.current_frame_path()
@@ -642,3 +774,11 @@ class MainWindow(QMainWindow):
         self.controller.clear_current_measurement()
         self.measurement_status_label.setText("Current frame measurement cleared.")
         self.statusBar().showMessage("Measurement cleared from current frame.")
+
+    def _refresh_window_title(self) -> None:
+        project_name = (
+            self._project_file_path.name
+            if self._project_file_path is not None
+            else "Unsaved Session"
+        )
+        self.setWindowTitle(f"Pixel Track - {project_name}")
